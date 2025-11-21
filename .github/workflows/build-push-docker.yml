@@ -1,0 +1,244 @@
+name: Build and Push CCR Docker Image on Upstream Release
+
+on:
+  schedule:
+    - cron: '0 2 */3 * *'
+  workflow_dispatch:
+    inputs:
+      force_rebuild_version:
+        description: 'Force rebuild specific version (e.g., v1.0.38)'
+        required: false
+        default: ''
+      skip_cache:
+        description: 'Skip all caches for fresh build'
+        required: false
+        default: 'true'
+        type: boolean
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 处理强制重建逻辑
+      - name: Handle force rebuild
+        id: force_rebuild
+        run: |
+          if [ -n "${{ github.event.inputs.force_rebuild_version }}" ]; then
+            echo "Force rebuild requested for version: ${{ github.event.inputs.force_rebuild_version }}"
+            echo "is_force_rebuild=true" >> $GITHUB_OUTPUT
+            echo "force_version=${{ github.event.inputs.force_rebuild_version }}" >> $GITHUB_OUTPUT
+          else
+            echo "is_force_rebuild=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 验证强制重建版本格式
+      - name: Validate force rebuild version
+        if: steps.force_rebuild.outputs.is_force_rebuild == 'true'
+        run: |
+          version="${{ github.event.inputs.force_rebuild_version }}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "❌ Invalid version format: $version"
+            echo "Expected format: v1.2.3"
+            exit 1
+          fi
+          echo "✅ Version format is valid: $version"
+
+      - name: Prepare last built SHA
+        id: last_built
+        if: steps.force_rebuild.outputs.is_force_rebuild == 'false'
+        run: |
+          if [ ! -f LAST_BUILT_SHA ]; then
+            echo "LAST_BUILT_SHA file not found, creating empty file"
+            touch LAST_BUILT_SHA
+          fi
+          
+          last_built_sha=$(cat LAST_BUILT_SHA || echo "")
+          echo "Last built SHA: $last_built_sha"
+          echo "LAST_BUILT_SHA=$last_built_sha" >> $GITHUB_OUTPUT
+
+      - name: Find latest release commit
+        id: release_candidate
+        if: steps.force_rebuild.outputs.is_force_rebuild == 'false'
+        env:
+          LAST_BUILT_SHA: ${{ steps.last_built.outputs.LAST_BUILT_SHA }}
+        run: |
+          per_page=50
+          echo "Scanning the most recent $per_page commits on upstream main..."
+          commits=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/musistudio/claude-code-router/commits?sha=main&per_page=$per_page")
+          
+          candidate_sha=""
+          candidate_message=""
+          candidate_version=""
+          
+          while IFS= read -r encoded_commit; do
+            [ -z "$encoded_commit" ] && continue
+            decoded=$(echo "$encoded_commit" | base64 --decode)
+            sha=$(echo "$decoded" | jq -r '.sha')
+            message=$(echo "$decoded" | jq -r '.commit.message')
+            
+            if [ -n "$LAST_BUILT_SHA" ] && [ "$sha" == "$LAST_BUILT_SHA" ]; then
+              echo "Reached previously built commit $LAST_BUILT_SHA, stopping search."
+              break
+            fi
+            
+            if [[ "$message" =~ (release[[:space:]]+)?(v[0-9]+\.[0-9]+\.[0-9]+) ]]; then
+              candidate_sha="$sha"
+              candidate_message="$message"
+              candidate_version="${BASH_REMATCH[2]}"
+              echo "Found release commit $candidate_sha with version $candidate_version"
+              break
+            fi
+          done <<< "$(echo "$commits" | jq -r '.[] | @base64')"
+          
+          if [ -n "$candidate_version" ]; then
+            echo "has_release=true" >> $GITHUB_OUTPUT
+            echo "IMAGE_TAG=$candidate_version" >> $GITHUB_OUTPUT
+            echo "COMMIT_SHA=$candidate_sha" >> $GITHUB_OUTPUT
+            {
+              echo "COMMIT_MESSAGE<<EOF"
+              echo "$candidate_message"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+          else
+            echo "No new release commit found."
+            echo "has_release=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 统一的 Docker 登录（用于镜像检查和构建）
+      - name: Log in to Docker Hub
+        if: steps.force_rebuild.outputs.is_force_rebuild == 'true' || steps.release_candidate.outputs.has_release == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Check if Docker image already exists
+        id: check_image
+        if: steps.force_rebuild.outputs.is_force_rebuild == 'false' && steps.release_candidate.outputs.has_release == 'true'
+        run: |
+          IMAGE_TAG="${{ steps.release_candidate.outputs.IMAGE_TAG }}"
+          REPO="${{ secrets.DOCKERHUB_USERNAME }}/ccr"
+          
+          if docker manifest inspect "${REPO}:${IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "Image ${REPO}:${IMAGE_TAG} already exists. Skipping build."
+            echo "image_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Image ${REPO}:${IMAGE_TAG} does not exist. Proceeding with build."
+            echo "image_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      # 统一计算最终的执行决策
+      - name: Set final build parameters
+        id: final_params
+        run: |
+          should_execute_build="false"
+          is_release="false"
+          image_tag=""
+          commit_sha=""
+          
+          if [ "${{ steps.force_rebuild.outputs.is_force_rebuild }}" == "true" ]; then
+            echo "Using force rebuild parameters"
+            should_execute_build="true"
+            is_release="true"
+            image_tag="${{ steps.force_rebuild.outputs.force_version }}"
+            echo "Force rebuild will execute for version: $image_tag"
+          elif [ "${{ steps.release_candidate.outputs.has_release }}" == "true" ] && \
+               [ "${{ steps.check_image.outputs.image_exists }}" == "false" ]; then
+            echo "Using normal flow parameters"
+            should_execute_build="true"
+            is_release="true"
+            image_tag="${{ steps.release_candidate.outputs.IMAGE_TAG }}"
+            commit_sha="${{ steps.release_candidate.outputs.COMMIT_SHA }}"
+            echo "Normal build will execute for version: $image_tag"
+          else
+            echo "Build will be skipped"
+            echo "- Force rebuild: ${{ steps.force_rebuild.outputs.is_force_rebuild }}"
+            echo "- Found release commit: ${{ steps.release_candidate.outputs.has_release }}"
+            echo "- Image exists: ${{ steps.check_image.outputs.image_exists }}"
+            echo "- Last built SHA: ${{ steps.last_built.outputs.LAST_BUILT_SHA }}"
+          fi
+          
+          echo "should_execute_build=$should_execute_build" >> $GITHUB_OUTPUT
+          echo "is_release=$is_release" >> $GITHUB_OUTPUT
+          echo "IMAGE_TAG=$image_tag" >> $GITHUB_OUTPUT
+          echo "TARGET_COMMIT_SHA=$commit_sha" >> $GITHUB_OUTPUT
+
+      - name: Update package.json with specific version
+        if: steps.final_params.outputs.should_execute_build == 'true'
+        run: |
+          VERSION="${{ steps.final_params.outputs.IMAGE_TAG }}"
+          NPM_VERSION=${VERSION#v}
+          
+          echo "Updating package.json to use version: $NPM_VERSION"
+          
+          jq --arg version "$NPM_VERSION" \
+            '.dependencies["@musistudio/claude-code-router"] = $version' \
+            package.json > package.json.tmp && mv package.json.tmp package.json
+          
+          echo "Updated package.json:"
+          cat package.json
+
+      - name: Set up Docker Buildx
+        if: steps.final_params.outputs.should_execute_build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        if: steps.final_params.outputs.should_execute_build == 'true'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            CACHE_BUST=${{ github.run_number }}-${{ steps.final_params.outputs.IMAGE_TAG }}-${{ steps.force_rebuild.outputs.is_force_rebuild }}
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/ccr:${{ steps.final_params.outputs.IMAGE_TAG }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/ccr:latest
+          no-cache: ${{ github.event.inputs.skip_cache == 'true' || steps.force_rebuild.outputs.is_force_rebuild == 'true' }}
+
+      - name: Update last built SHA
+        if: success() && steps.final_params.outputs.should_execute_build == 'true' && steps.force_rebuild.outputs.is_force_rebuild == 'false'
+        run: |
+          echo "Updating LAST_BUILT_SHA to ${{ steps.final_params.outputs.TARGET_COMMIT_SHA }}"
+          echo "${{ steps.final_params.outputs.TARGET_COMMIT_SHA }}" > LAST_BUILT_SHA
+          
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          
+          git add LAST_BUILT_SHA
+          if git diff --staged --quiet; then
+            echo "No changes in LAST_BUILT_SHA to commit."
+          else
+            git commit -m "chore: Update last built SHA to ${{ steps.final_params.outputs.TARGET_COMMIT_SHA }}"
+            git push
+          fi
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Force Rebuild**: ${{ steps.force_rebuild.outputs.is_force_rebuild }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Should Execute Build**: ${{ steps.final_params.outputs.should_execute_build }}" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ steps.force_rebuild.outputs.is_force_rebuild }}" == "false" ]; then
+            echo "- **Last Built SHA**: ${{ steps.last_built.outputs.LAST_BUILT_SHA }}" >> $GITHUB_STEP_SUMMARY
+            echo "- **Found Release Commit**: ${{ steps.release_candidate.outputs.has_release }}" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ steps.release_candidate.outputs.has_release }}" == "true" ]; then
+              echo "- **Release Commit SHA**: ${{ steps.release_candidate.outputs.COMMIT_SHA }}" >> $GITHUB_STEP_SUMMARY
+              echo "- **Release Version**: ${{ steps.release_candidate.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+              echo "- **Image Exists**: ${{ steps.check_image.outputs.image_exists }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          if [ "${{ steps.final_params.outputs.should_execute_build }}" == "true" ]; then
+            echo "- **Image Tag**: ${{ steps.final_params.outputs.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          fi
