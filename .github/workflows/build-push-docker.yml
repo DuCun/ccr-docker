@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force_rebuild_version:
-        description: 'Force rebuild specific version (e.g., v1.0.38)'
+        description: 'Force rebuild specific version (e.g., 1.0.38)'
         required: false
         default: ''
       skip_cache:
@@ -71,35 +71,50 @@ jobs:
         env:
           LAST_BUILT_SHA: ${{ steps.last_built.outputs.LAST_BUILT_SHA }}
         run: |
-          per_page=50
-          echo "Scanning the most recent $per_page commits on upstream main..."
-          commits=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/musistudio/claude-code-router/commits?sha=main&per_page=$per_page")
-          
+          per_page=100
+          page=1
+          max_pages=10
+          found_last_built=false
+
           candidate_sha=""
           candidate_message=""
           candidate_version=""
-          
-          while IFS= read -r encoded_commit; do
-            [ -z "$encoded_commit" ] && continue
-            decoded=$(echo "$encoded_commit" | base64 --decode)
-            sha=$(echo "$decoded" | jq -r '.sha')
-            message=$(echo "$decoded" | jq -r '.commit.message')
-            
-            if [ -n "$LAST_BUILT_SHA" ] && [ "$sha" == "$LAST_BUILT_SHA" ]; then
-              echo "Reached previously built commit $LAST_BUILT_SHA, stopping search."
+
+          echo "Scanning upstream commits until LAST_BUILT_SHA is found..."
+
+          while [ $page -le $max_pages ] && [ "$found_last_built" = "false" ]; do
+            echo "Fetching page $page..."
+            commits=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://api.github.com/repos/musistudio/claude-code-router/commits?sha=main&per_page=$per_page&page=$page")
+
+            if [ "$(echo "$commits" | jq 'length')" -eq 0 ]; then
+              echo "No more commits to scan."
               break
             fi
-            
-            if [[ "$message" =~ (release[[:space:]]+)?(v[0-9]+\.[0-9]+\.[0-9]+) ]]; then
-              candidate_sha="$sha"
-              candidate_message="$message"
-              candidate_version="${BASH_REMATCH[2]}"
-              echo "Found release commit $candidate_sha with version $candidate_version"
-              break
-            fi
-          done <<< "$(echo "$commits" | jq -r '.[] | @base64')"
-          
+
+            while IFS= read -r encoded_commit; do
+              [ -z "$encoded_commit" ] && continue
+              decoded=$(echo "$encoded_commit" | base64 --decode)
+              sha=$(echo "$decoded" | jq -r '.sha')
+              message=$(echo "$decoded" | jq -r '.commit.message')
+
+              if [ -n "$LAST_BUILT_SHA" ] && [ "$sha" == "$LAST_BUILT_SHA" ]; then
+                echo "Reached previously built commit $LAST_BUILT_SHA, stopping search."
+                found_last_built=true
+                break
+              fi
+
+              if [ -z "$candidate_version" ] && [[ "$message" =~ (release[[:space:]]+)?v?([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+                candidate_sha="$sha"
+                candidate_message="$message"
+                candidate_version="${BASH_REMATCH[2]}"
+                echo "Found release commit $candidate_sha with version $candidate_version"
+              fi
+            done <<< "$(echo "$commits" | jq -r '.[] | @base64')"
+
+            page=$((page + 1))
+          done
+
           if [ -n "$candidate_version" ]; then
             echo "has_release=true" >> $GITHUB_OUTPUT
             echo "IMAGE_TAG=$candidate_version" >> $GITHUB_OUTPUT
